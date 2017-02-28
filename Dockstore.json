@@ -1,0 +1,26 @@
+{
+  "output": {
+    "path": "/tmp/varscan.cnv",
+    "class": "File"
+  },
+  "genome": {
+    "path": "http://hgwdev.cse.ucsc.edu/~jeltje/public_data/genome.fa.gz",
+    "class": "File"
+  },
+  "control_bam_input": {
+    "path":"https://dcc.icgc.org/api/v1/download?fn=/PCAWG/reference_data/data_for_testing/HCC1143_ds/HCC1143_BL.bam",
+    "class": "File"
+  },
+  "centromeres": {
+    "path": "http://hgwdev.cse.ucsc.edu/~jeltje/public_data/centromeres.bed",
+    "class": "File"
+  },
+  "tumor_bam_input": {
+    "path":"https://dcc.icgc.org/api/v1/download?fn=/PCAWG/reference_data/data_for_testing/HCC1143_ds/HCC1143_BL.bam",
+    "class": "File"
+  },
+  "targets": {
+    "path": "http://hgwdev.cse.ucsc.edu/~jeltje/public_data/targets.bed",
+    "class": "File"
+  }
+}

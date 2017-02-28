@@ -1,0 +1,337 @@
+#! /bin/bash
+
+print_usage(){
+>&2 cat <<EOF
+$0 -c <control bam file> -t <tumor bam file> -q <sample ID> -i <genome fasta> -b <centromere bed file> -w <exome whitelist> -s <tmp output>
+	Wrapper script for Varscan2
+	Runs the following steps:
+	1. samtools flagstat on each bam file
+	2. samtools mpileup on both bam files
+	3. determine unique mapped read ratio
+	4. VarScan copynumber
+	5. Remove low coverage regions
+	6. VarScan copyCaller
+	7. calculate median for recentering
+	8. VarScan copyCaller recenter
+	9. Separate chromosome arms
+	10. DNAcopy
+	11. Merge chromosome arms
+
+OPTIONS:
+   -h      Show this message
+   -t      tumor bam file
+   -c      control bam file
+   -q      optional sample ID, eg TCGA-001-4-2018
+   -i      genome that was used to create the bam files
+   -b      centromere locations (bed format)
+   -w      exome whitelist (bed format)
+   -s      directory for temporary files. The script creates a directory varscan.N inside.
+   -d      do not delete temporary output
+   -n      <varscan.N> instead of creating a new temporary directory, use this one
+
+EOF
+}
+
+cBam='False'
+tBam='False'
+sampleid="sample"
+idx='False'
+cent='False'
+white='False'
+scratch=
+prevDir=
+cleanup=true
+
+while getopts "ht:c:q:i:b:w:s:n:a:d" OPTION
+do
+     case $OPTION in
+         h)
+             print_usage
+             exit
+             ;;
+         t)
+             tBam=$OPTARG
+             ;;
+         c)
+             cBam=$OPTARG
+             ;;
+         q)
+             sampleid=$OPTARG
+             ;;
+         i)
+             idx=$OPTARG
+             ;;
+         b)
+             cent=$OPTARG
+             ;;
+         w)
+             white=$OPTARG
+             ;;
+         s)
+             scratch=$OPTARG
+             ;;
+         d)
+             cleanup=false
+             ;;
+         n)
+             prevDir=$OPTARG
+             ;;
+         ?)
+             print_usage
+             exit
+             ;;
+     esac
+done
+
+graceful_death() {
+	>&2 echo "ERROR: Cannot finish $0 because $1";
+	exit 1
+}
+
+# Check if all file arguments have been given and are valid
+file_check() {
+    if [ $1 == 'False' ]; then
+        print_usage
+        graceful_death "some input arguments are missing"
+    fi
+    if [[ ! -e "$1" ]]; then
+        print_usage
+        graceful_death "can't find $1"
+    fi
+}
+
+for i in $cBam $tBam $idx $cent $white; do
+        file_check $i
+done
+
+# Sanity check
+tmpdir=
+if [[ -z "$prevDir" ]] && [[ -z $scratch ]]; then
+	graceful_death "Please give either the -n OR -s option"
+fi
+
+# select correct temp dir
+if  [[ -z "$prevDir" ]]; then
+	if [ ! -d "$scratch" ]; then
+		graceful_death "cannot find scratch output dir $scratch"
+	fi 
+	tmpExt=$RANDOM
+	tmpdir="$scratch/varscan.$tmpExt"
+	mkdir -p $tmpdir
+else
+	if [ ! -d "$prevDir" ]; then
+		graceful_death "cannot find previous run directory $prevDir"
+	fi
+	tmpdir=$prevDir
+fi
+>&2 echo "Output files will be stored in $tmpdir"
+
+# Make sure all inputs are for the same genome
+>&2 echo "Checking inputs..."
+
+# unzip genome, if necessary
+genofa="$tmpdir/genome.fa"
+if [[ "$idx" == *.gz ]]; then
+    zcat $idx > $genofa
+else
+    ln -s $idx $genofa
+fi
+# index genome
+>&2 echo "indexing $genofa"
+samtools faidx $genofa
+
+
+# Check that the bam files are sorted and index them
+issort(){
+  didsort=$(samtools view -H $1 | grep -m 1 ^@HD)
+  if [[ "$didsort" != *SO:coordinate ]]; then
+    >&2 echo "Sorting $1 to $2..."
+    samtools sort $1 $2
+  else
+    ln -s $1 $2.bam
+  fi
+    >&2 echo "indexing $2.bam..."
+  samtools index $2.bam
+}
+issort $tBam "$tmpdir/t"
+tBam="$tmpdir/t.bam"
+issort $cBam "$tmpdir/c"
+cBam="$tmpdir/c.bam"
+
+contain(){
+  if [[ $(comm -23 $1 $2) ]]; then
+    graceful_death "some or all of the chromosomes in the input $3 cannot be found in the genome fasta; please make sure all your inputs are for the same genome version"
+  fi
+}
+
+samtools view -H $tBam | grep ^@SQ | cut -f2 | cut -f2 -d':' | sort > $tmpdir/bam.chrs
+cut -f1 $cent | sort > $tmpdir/cent.chrs
+cut -f1 $white | sort -u > $tmpdir/target.chrs
+grep '>' $genofa | sed 's/\s.*//' | sed 's/>//' | sort > $tmpdir/geno.chrs
+
+# all bam chrs, and all bed chromosomes should be in the genome (but not vice versa)
+contain $tmpdir/bam.chrs $tmpdir/geno.chrs $tBam
+contain $tmpdir/cent.chrs $tmpdir/geno.chrs $cent
+contain $tmpdir/target.chrs $tmpdir/geno.chrs $white
+
+# checks if a file exists and has more than one line in it
+# several programs in this wrapper will output a single line if they fail
+exists(){
+  if [ -e "$1" ]
+  then
+    ct=$(head -n 2 $1 | wc -l | cut -f1 -d' ')
+    if [ "$ct" -eq "2" ]; then
+        return 0
+    else
+        return 1
+    fi
+  else
+    return 1
+  fi
+}
+
+# runOrDie gets its variables directly from MAIN
+runOrDie(){
+	if exists "$outfile" ; then
+	    return 0	# nothing to be done
+	fi
+	for file in $infile; do
+		ext=$(echo $file | sed "s/.*\.//");
+		[ "$ext" == "bam" ] && continue	# do not check bam files again
+		if ! exists "$file" && [ -z $DEBUG ]; then
+			graceful_death "cannot run $cmd: missing or corrupted $infile"
+		fi
+	done
+	>&2 echo $cmd
+	if [[ -z $DEBUG ]]; then
+		date >&2
+		eval $cmd
+		if ! exists "$outfile" ; then
+			graceful_death "failed to find $outfile"
+		fi
+	fi
+}
+
+
+
+
+# correct version of samtools?
+cmd="samtools 2>&1 | grep Version | cut -f2 -d' '"
+sVersion=$(eval $cmd)
+if [ $sVersion != "0.1.18" ]; then
+	graceful_death "wrong samtools version: expected 0.1.18, got $sVersion"
+fi
+
+# find location of run script so we can get the other necessary scripts
+DIR=$( cd "$( dirname "${BASH_SOURCE[0]}" )" && pwd )
+DNAcopy=$DIR/basicDNAcopy.R
+findDelta=$DIR/meanLogRatioByChromosome.py
+separateArms=$DIR/separateArms.py
+varScan="nice java -Xmx2048m -jar $DIR/VarScan.jar"
+
+########## MAIN ################
+
+# Samtools flagstat
+infile="$cBam"
+outfile="$tmpdir/control.flagstat"
+cmd="samtools flagstat $infile > $outfile"
+runOrDie 
+
+infile=$tBam
+outfile="$tmpdir/tumor.flagstat"
+cmd="samtools flagstat $infile > $outfile"
+runOrDie
+
+# Samtools mpileup
+infile="$genofa $cBam $tBam"
+outfile="$tmpdir/mpileup"
+cmd="samtools mpileup -q 1 -B -l $white -f $infile > $outfile"
+runOrDie
+
+
+ntest=$(head -n 100000 $tmpdir/mpileup | cut -f3 | grep -c N)
+if  [ "$ntest" -eq "100000" ]; then
+	graceful_death "it looks like the chromosome names in your bam files don't match the ones in the input genome"
+fi
+
+# Varscan copynumber
+# must calculate data ratio from flagstat output
+# also must move to output dir to run this because varscan doesn't parse the output name
+dratio=
+if exists $tmpdir/control.flagstat && exists $tmpdir/tumor.flagstat ; then
+	cnum=$(grep -m 1 mapped $tmpdir/control.flagstat | cut -f1 -d' ')
+	tnum=$(grep -m 1 mapped $tmpdir/tumor.flagstat | cut -f1 -d' ')
+	dratio=$(echo "scale=2;$cnum/$tnum" | bc)
+fi
+if [[ -z $dratio ]] && [ -z $DEBUG ]; then
+	graceful_death "could not determine data ratio from $tmpdir/control.flagstat and $tmpdir/tumor.flagstat"
+fi 
+
+pushd $tmpdir > /dev/null
+vOptions='--min-segment-size 100 --mpileup 1'
+dr="--data-ratio $dratio"	# .88 works instead of 0.88
+infile="mpileup"
+outfile="output.copynumber"
+cmd="$varScan copynumber $infile output $vOptions $dr"	# output is base name, copynumber gets added as extension
+runOrDie
+pushd > /dev/null
+
+# From the output, filter any segments for which the tumor coverage is less than 10
+# and the control coverage is less than 20
+awk -v x=10 '$6 >= x' $tmpdir/output.copynumber | \
+awk -v x=20 '$5 >= x' > $tmpdir/output.copynumber.cov
+
+
+# Varscan copycaller
+infile="$tmpdir/output.copynumber.cov"
+outfile="$tmpdir/copyCalled"
+ccOptions="--output-file $outfile --output-homdel-file $outfile.homdel"
+cmd="$varScan copyCaller $infile $ccOptions"
+runOrDie
+
+# Calculate recenter amount
+infile="$tmpdir/copyCalled"
+delta=$($findDelta $infile)
+if [ -z "$delta" ]; then
+    graceful_death "Could not find chr average, please make sure your bamfiles cover all chromosomes (samtools idxstats file.bam)"
+fi
+
+# Rerun copycaller
+infile="$tmpdir/output.copynumber.cov"
+outfile="$tmpdir/copyCalled.recenter"
+ccOptions="--output-file $outfile --output-homdel-file $outfile.homdel"
+
+cmp=$(awk -v delta=$delta 'END{if (delta < -0.2) {print "lt"} else {if (delta > 0.2) {print "gt"} else {print "eq"}}}' < /dev/null)
+if [[ "$cmp" == "lt" ]]; then
+    rd=$(echo $delta | sed 's/-//')
+    cmd="$varScan copyCaller $infile $ccOptions --recenter-down $rd"
+    runOrDie
+elif [[ "$cmp" == "gt" ]]; then
+    cmd="$varScan copyCaller $infile $ccOptions --recenter-up $delta"
+    runOrDie
+else
+    ln -s copyCalled $tmpdir/copyCalled.recenter
+fi
+
+# add p and q to chromosome arms
+infile="$tmpdir/copyCalled.recenter"
+outfile="$tmpdir/copyCalled.recenter.sep"
+cmd="$separateArms $infile $cent > $outfile"
+runOrDie
+
+# Circular binary segmentation
+infile="$tmpdir/copyCalled.recenter.sep"
+outfile="$tmpdir/copyCalled.recenter.sep.SD.2.5.dnacopy.out"
+cmd="Rscript $DNAcopy $infile 2.5 >/dev/null"
+runOrDie
+
+# remove the arms and print to stdout
+sed 's/\.[pq]	/	/' $tmpdir/copyCalled.recenter.sep.SD.2.5.dnacopy.out | \
+	sed "s/^sample/$sampleid/"
+
+# clean up
+if $cleanup; then
+    rm $tmpdir/*
+    rmdir $tmpdir
+fi
+
